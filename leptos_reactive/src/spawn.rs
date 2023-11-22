@@ -75,7 +75,17 @@ where
     F: Future<Output = ()> + 'static,
 {
     cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
+        if #[cfg(all(target_arch = "wasm32", target_os = "wasi"))] {
+            let waker = std::sync::Arc::new(DummyWaker).into();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            futures::pin_mut!(fut);
+            let std::task::Poll::Ready(_) = fut.as_mut().poll(&mut cx) else {
+                // TODO: Provide a proper executor for WASI, based on `poll_list`
+                panic!("Pending futures are not yet available on WASI.")
+            };
+        }
+        else if #[cfg(target_arch = "wasm32")] {
             wasm_bindgen_futures::spawn_local(fut)
         }
         else if #[cfg(any(test, doctest))] {
@@ -91,4 +101,11 @@ where
             futures::executor::block_on(fut)
         }
     }
+}
+
+/// A do-nothing Waker for the single-threaded WASI environment
+struct DummyWaker;
+
+impl std::task::Wake for DummyWaker {
+    fn wake(self: std::sync::Arc<Self>) {}
 }
