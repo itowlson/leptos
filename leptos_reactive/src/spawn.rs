@@ -75,15 +75,16 @@ where
     F: Future<Output = ()> + 'static,
 {
     cfg_if! {
-        if #[cfg(all(target_arch = "wasm32", target_os = "wasi"))] {
-            let waker = std::sync::Arc::new(DummyWaker).into();
-            let mut cx = std::task::Context::from_waker(&waker);
+        if #[cfg(all(target_arch = "wasm32", target_os = "wasi", feature = "ssr"))] {
+            wasi_spawn::run(fut)
+            // let waker = std::sync::Arc::new(DummyWaker).into();
+            // let mut cx = std::task::Context::from_waker(&waker);
 
-            futures::pin_mut!(fut);
-            let std::task::Poll::Ready(_) = fut.as_mut().poll(&mut cx) else {
-                // TODO: Provide a proper executor for WASI, based on `poll_list`
-                panic!("Pending futures are not yet available on WASI.")
-            };
+            // futures::pin_mut!(fut);
+            // let std::task::Poll::Ready(_) = fut.as_mut().poll(&mut cx) else {
+            //     // TODO: Provide a proper executor for WASI, based on `poll_list`
+            //     panic!("Pending futures are not yet available on WASI.")
+            // };
         }
         else if #[cfg(target_arch = "wasm32")] {
             wasm_bindgen_futures::spawn_local(fut)
@@ -103,9 +104,72 @@ where
     }
 }
 
-/// A do-nothing Waker for the single-threaded WASI environment
-struct DummyWaker;
+#[cfg(feature = "ssr")]
+mod wasi_spawn {
 
-impl std::task::Wake for DummyWaker {
-    fn wake(self: std::sync::Arc<Self>) {}
+pub mod wit {
+    #![allow(missing_docs)]
+
+    wit_bindgen::generate!({
+        world: "platform",
+        path: "../../spin/wit",
+    });
+    pub use fermyon::spin2_0_0 as v2;
+}
+
+use std::future::Future;
+use std::mem;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+
+static WAKERS: Mutex<Vec<(wit::wasi::io::poll::Pollable, Waker)>> = Mutex::new(Vec::new());
+
+/// Run the specified future to completion blocking until it yields a result.
+///
+/// Based on an executor using `wasi::io/poll/poll-list`,
+pub fn run<T>(future: impl Future<Output = T>) -> T {
+    futures::pin_mut!(future);
+    struct DummyWaker;
+
+    impl Wake for DummyWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Arc::new(DummyWaker).into();
+
+    loop {
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Pending => {
+                let mut new_wakers = Vec::new();
+
+                let wakers = mem::take::<Vec<_>>(&mut WAKERS.lock().unwrap());
+
+                assert!(!wakers.is_empty());
+
+                let pollables = wakers
+                    .iter()
+                    .map(|(pollable, _)| pollable)
+                    .collect::<Vec<_>>();
+
+                let mut ready = vec![false; wakers.len()];
+
+                for index in wit::wasi::io::poll::poll_list(&pollables) {
+                    ready[usize::try_from(index).unwrap()] = true;
+                }
+
+                for (ready, (pollable, waker)) in ready.into_iter().zip(wakers) {
+                    if ready {
+                        waker.wake()
+                    } else {
+                        new_wakers.push((pollable, waker));
+                    }
+                }
+
+                *WAKERS.lock().unwrap() = new_wakers;
+            }
+            Poll::Ready(result) => break result,
+        }
+    }
+}
+
 }
